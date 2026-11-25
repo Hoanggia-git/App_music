@@ -1,0 +1,111 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      distribution:
+        description: Provisioning profile type used to sign the installable IPA
+        required: true
+        default: development
+        type: choice
+        options:
+          - development
+          - ad-hoc
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    name: Archive signed iOS app
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      IOS_BUNDLE_IDENTIFIER: ${{ secrets.IOS_BUNDLE_IDENTIFIER }}
+      IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+      IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+      IOS_KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+      IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+      DISTRIBUTION: ${{ inputs.distribution }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check signing configuration
+        shell: bash
+        run: |
+          required=(APPLE_TEAM_ID IOS_BUNDLE_IDENTIFIER IOS_CERTIFICATE_BASE64 IOS_CERTIFICATE_PASSWORD IOS_KEYCHAIN_PASSWORD IOS_PROVISION_PROFILE_BASE64)
+          for name in "${required[@]}"; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing repository secret: $name"
+              exit 1
+            fi
+          done
+
+      - name: Install certificate and provisioning profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          cert_path="$RUNNER_TEMP/certificate.p12"
+          profile_path="$RUNNER_TEMP/profile.mobileprovision"
+          keychain_path="$RUNNER_TEMP/mochy-signing.keychain-db"
+          echo -n "$IOS_CERTIFICATE_BASE64" | base64 --decode > "$cert_path"
+          echo -n "$IOS_PROVISION_PROFILE_BASE64" | base64 --decode > "$profile_path"
+          security create-keychain -p "$IOS_KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$IOS_KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$cert_path" -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$IOS_KEYCHAIN_PASSWORD" "$keychain_path"
+          security list-keychain -d user -s "$keychain_path"
+          security cms -D -i "$profile_path" > "$RUNNER_TEMP/profile.plist"
+          profile_name=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist")
+          profile_uuid=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$profile_path" "$HOME/Library/MobileDevice/Provisioning Profiles/$profile_uuid.mobileprovision"
+          echo "PROFILE_NAME=$profile_name" >> "$GITHUB_ENV"
+
+      - name: Archive iPhone app
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcodebuild \
+            -project ios/MochyIOS/MochyIOS.xcodeproj \
+            -scheme MochyIOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/MochyIOS.xcarchive" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            PRODUCT_BUNDLE_IDENTIFIER="$IOS_BUNDLE_IDENTIFIER" \
+            CODE_SIGN_STYLE=Manual \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME" \
+            clean archive
+
+      - name: Export installable IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          export_options="$RUNNER_TEMP/ExportOptions.plist"
+          cat > "$export_options" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>$DISTRIBUTION</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>provisioningProfiles</key><dict><key>$IOS_BUNDLE_IDENTIFIER</key><string>$PROFILE_NAME</string></dict>
+          </dict></plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/MochyIOS.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$export_options"
+
+      - name: Upload signed IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: MochyIOS-${{ inputs.distribution }}-ipa
+          path: ${{ runner.temp }}/export/*.ipa
+          if-no-files-found: error
+          retention-days: 14
